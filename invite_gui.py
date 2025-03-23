@@ -56,11 +56,19 @@ class TelegramWorker(QThread):
             return True
         except errors.RPCError as e:
             error_message = str(e)
+            self.last_error_message = error_message  # Сохраняем сообщение об ошибке
+            
             if "admin rights do not allow you to do this" in error_message:
                 self.update_log.emit("❌ У вас недостаточно прав администратора для добавления пользователей")
                 self.update_log.emit("🛑 Работа бота остановлена")
-                self.stop_flag = True  # Останавливаем бота
+                self.stop_flag = True
                 return False
+            elif "Recently logged-in users cannot add or change admins" in error_message:
+                self.update_log.emit("❌ Ошибка: Недавно авторизованные пользователи не могут добавлять администраторов")
+                self.update_log.emit("🛑 Работа бота остановлена")
+                self.stop_flag = True
+                return False
+            
             self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
             return False
 
@@ -227,8 +235,19 @@ class TelegramWorker(QThread):
             # Подключаемся
             await self.client.connect()
             
-            # Проверяем авторизацию
-            if not await self.client.is_user_authorized():
+            # Проверяем авторизацию с помощью is_user_authorized()
+            is_authorized = await self.client.is_user_authorized()
+            
+            # Дополнительная проверка через get_me()
+            if is_authorized:
+                try:
+                    me = await self.client.get_me()
+                    if not me:
+                        is_authorized = False
+                except:
+                    is_authorized = False
+            
+            if not is_authorized:
                 self.update_log.emit("❌ Сессия не авторизована")
                 return False
                 
@@ -341,15 +360,30 @@ class CheckAccountsWorker(QThread):
     async def _check_account(self, client, account):
         """Асинхронная проверка одного аккаунта"""
         try:
+            # Принудительно отключаем клиент если он был подключен
+            if client.is_connected():
+                await client.disconnect()
+            
             await client.connect()
             
-            if not await client.is_user_authorized():
-                self.log_signal.emit("❌ Аккаунт не авторизован")
-                self.show_dialog_signal.emit(account, "не авторизован")
-            else:
+            try:
+                # Проверяем авторизацию
+                if not await client.is_user_authorized():
+                    self.log_signal.emit("❌ Аккаунт не авторизован")
+                    self.show_dialog_signal.emit(account, "не авторизован")
+                    return
+                    
+                # Проверяем через get_me()
+                me = await client.get_me()
+                if not me:
+                    self.log_signal.emit("❌ Аккаунт не авторизован")
+                    self.show_dialog_signal.emit(account, "не авторизован")
+                    return
+                    
                 self.log_signal.emit("✅ Аккаунт авторизован")
+                
+                # Добавляем проверку через SpamBot
                 try:
-                    # Проверяем статус через SpamBot
                     spam_bot = await client.get_entity('SpamBot')
                     await client.send_message(spam_bot, '/start')
                     await asyncio.sleep(2)  # Ждем ответ
@@ -359,10 +393,16 @@ class CheckAccountsWorker(QThread):
                         status = messages[0].message
                         self.log_signal.emit(f"📝 Статус от @SpamBot: {status}")
                 except Exception as e:
-                    self.log_signal.emit(f"⚠️ Не удалось получить статус: {str(e)}")
-                    
+                    self.log_signal.emit(f"⚠️ Не удалось получить статус от SpamBot: {str(e)}")
+                
+            except Exception as e:
+                self.log_signal.emit(f"❌ Ошибка проверки авторизации: {str(e)}")
+                self.show_dialog_signal.emit(account, "не авторизован")
+                return
+            
         finally:
-            await client.disconnect()
+            if client and client.is_connected():
+                await client.disconnect()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -537,13 +577,13 @@ class MainWindow(QMainWindow):
         delete_session_btn = QPushButton("Удалить сессию")
         delete_session_btn.clicked.connect(self.delete_session)
         
-        refresh_sessions_btn = QPushButton("Обновить список")
-        refresh_sessions_btn.clicked.connect(self.refresh_sessions)
+        add_session_btn = QPushButton("Добавить сессию")
+        add_session_btn.clicked.connect(self.add_new_session)
         
         session_layout.addWidget(QLabel("Активный аккаунт:"))
         session_layout.addWidget(self.session_combo)
         session_layout.addWidget(delete_session_btn)
-        session_layout.addWidget(refresh_sessions_btn)
+        session_layout.addWidget(add_session_btn)
         layout.addLayout(session_layout)
 
         # Настройки
@@ -726,93 +766,86 @@ class MainWindow(QMainWindow):
 
     def restore_session(self, account):
         """Восстановление сессии"""
-        self.check_log.append(f"\nНачинаем восстановление сессии {account}...")
-        
         try:
-            session_file = os.path.join('sessions', account)
-            config_file = os.path.join('configs', f"{account}.json")
+            # Удаляем старые файлы сессии
+            session_file = os.path.join('sessions', f"{account}.session")
+            journal_file = os.path.join('sessions', f"{account}.session-journal")
             
-            # Загружаем API данные
+            if os.path.exists(session_file):
+                os.remove(session_file)
+            if os.path.exists(journal_file):
+                os.remove(journal_file)
+            
+            # Загружаем конфигурацию
+            config_file = os.path.join('configs', f"{account}.json")
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                if 'telegram_api' in config:
-                    api_data = config['telegram_api']
-                    api_id = api_data.get('api_id')
-                    api_hash = api_data.get('api_hash')
-                else:
-                    api_id = config.get('app_id')
-                    api_hash = config.get('app_hash')
+                api_id = config['telegram_api']['api_id']
+                api_hash = config['telegram_api']['api_hash']
             
-            # Форматируем номер телефона
             phone = account
             if not phone.startswith('+'):
                 phone = '+' + phone
             
-            self.check_log.append(f"📱 Используем номер: {phone}")
+            self.log_signal.emit(f"📱 Используем номер: {phone}")
             
-            # Создаем клиент в синхронном режиме
+            # Создаем новый клиент
             client = TelegramClient(session_file, api_id, api_hash)
             
-            try:
-                client.connect()
-                
-                # Проверяем, не авторизован ли уже клиент
-                if client.is_user_authorized():
-                    self.check_log.append("✅ Клиент уже авторизован!")
-                    return
+            async def auth_process():
+                try:
+                    await client.connect()
                     
-                # Отправляем запрос на код
-                self.check_log.append("📤 Отправляем запрос на код в Telegram...")
-                send_code_result = client.send_code_request(
-                    phone,
-                    force_sms=False  # Принудительно отключаем SMS
-                )
-                
-                # Запрашиваем код у пользователя
-                code, ok = QInputDialog.getText(
-                    self,
-                    'Введите код',
-                    f'Введите код, отправленный в Telegram для {phone}:'
-                )
-                
-                if ok and code:
+                    # Отправляем код
+                    self.log_signal.emit("📤 Отправка кода подтверждения...")
+                    send_code = await client.send_code_request(phone)
+                    
+                    code, ok = QInputDialog.getText(
+                        None,
+                        "Подтверждение",
+                        "Введите код из Telegram:"
+                    )
+                    
+                    if not ok or not code:
+                        return False
+                        
                     try:
-                        self.check_log.append("🔄 Пытаемся войти с полученным кодом...")
-                        client.sign_in(
-                            phone=phone,
-                            code=code,
-                            phone_code_hash=send_code_result.phone_code_hash
-                        )
-                        self.check_log.append("✅ Авторизация успешно восстановлена!")
+                        await client.sign_in(phone=phone, code=code)
+                        self.log_signal.emit("✅ Успешная авторизация!")
+                        return True
                         
                     except SessionPasswordNeededError:
-                        self.check_log.append("🔐 Требуется двухфакторная аутентификация...")
                         password, ok = QInputDialog.getText(
-                            self,
-                            'Двухфакторная аутентификация',
-                            'Введите пароль двухфакторной аутентификации:',
+                            None,
+                            "2FA",
+                            "Введите пароль двухфакторной аутентификации:",
                             QLineEdit.Password
                         )
-                        
                         if ok and password:
-                            client.sign_in(password=password)
-                            self.check_log.append("✅ Авторизация успешно восстановлена!")
-                        else:
-                            self.check_log.append("❌ Отменено пользователем")
-                    
-                    except Exception as e:
-                        self.check_log.append(f"❌ Ошибка при вводе кода: {str(e)}")
-                else:
-                    self.check_log.append("❌ Отменено пользователем")
-                    
-            finally:
-                client.disconnect()
+                            await client.sign_in(password=password)
+                            self.log_signal.emit("✅ Успешная авторизация с 2FA!")
+                            return True
+                        return False
+                        
+                finally:
+                    if client.is_connected():
+                        await client.disconnect()
+            
+            # Создаем и запускаем event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            success = loop.run_until_complete(auth_process())
+            loop.close()
+            
+            if success:
+                self.log_signal.emit("✅ Сессия успешно восстановлена")
+                # Перезапускаем проверку аккаунта
+                self.check_accounts([account])
                 
         except Exception as e:
-            self.check_log.append(f"❌ Ошибка при восстановлении сессии: {str(e)}")
-            # Выводим полный traceback для отладки
+            self.log_signal.emit(f"❌ Ошибка при восстановлении сессии: {str(e)}")
             import traceback
-            self.check_log.append(f"Детали ошибки:\n{traceback.format_exc()}")
+            self.log_signal.emit(f"Детали ошибки:\n{traceback.format_exc()}")
 
     def delete_session_files(self, account):
         """Удаление файлов сессии"""
@@ -1303,6 +1336,113 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.check_log.append(f"❌ Ошибка при удалении сессии: {str(e)}")
             return False
+
+    def add_new_session(self):
+        """Добавление новой сессии"""
+        try:
+            # Запрашиваем данные для новой сессии
+            phone, ok = QInputDialog.getText(
+                self,
+                "Новая сессия",
+                "Введите номер телефона (в международном формате):"
+            )
+            if not ok or not phone:
+                return
+                
+            api_id, ok = QInputDialog.getText(
+                self,
+                "Новая сессия",
+                "Введите API ID:"
+            )
+            if not ok or not api_id:
+                return
+                
+            api_hash, ok = QInputDialog.getText(
+                self,
+                "Новая сессия",
+                "Введите API Hash:"
+            )
+            if not ok or not api_hash:
+                return
+
+            # Создаем клиента
+            session_file = os.path.join('sessions', phone)
+            client = TelegramClient(session_file, int(api_id), api_hash)
+            
+            async def auth_process():
+                await client.connect()
+                
+                # Отправляем код подтверждения
+                self.log_message("📤 Отправка кода подтверждения...")
+                phone_clean = phone.replace('+', '').strip()
+                send_code = await client.send_code_request(phone_clean)
+                
+                # Запрашиваем код у пользователя
+                code, ok = QInputDialog.getText(
+                    self,
+                    "Подтверждение",
+                    "Введите код, полученный в Telegram:"
+                )
+                if not ok or not code:
+                    await client.disconnect()
+                    return False
+                
+                try:
+                    # Пытаемся войти с полученным кодом
+                    await client.sign_in(phone=phone_clean, code=code)
+                    self.log_message("✅ Успешная авторизация!")
+                    return True
+                    
+                except SessionPasswordNeededError:
+                    # Если требуется двухфакторная аутентификация
+                    password, ok = QInputDialog.getText(
+                        self,
+                        "Двухфакторная аутентификация",
+                        "Введите пароль двухфакторной аутентификации:",
+                        QLineEdit.Password
+                    )
+                    if ok and password:
+                        await client.sign_in(password=password)
+                        self.log_message("✅ Успешная авторизация с 2FA!")
+                        return True
+                    return False
+                    
+                except Exception as e:
+                    self.log_message(f"❌ Ошибка при авторизации: {str(e)}")
+                    return False
+            
+            # Создаем и запускаем event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            success = loop.run_until_complete(auth_process())
+            loop.close()
+            
+            if success:
+                # Сохраняем конфигурацию
+                config = {
+                    'telegram_api': {
+                        'api_id': api_id,
+                        'api_hash': api_hash,
+                        'phone': phone
+                    }
+                }
+                
+                config_file = os.path.join('configs', f"{phone}.json")
+                with open(config_file, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4, ensure_ascii=False)
+                
+                self.log_message("✅ Сессия успешно создана и сохранена")
+                
+                # Обновляем список сессий
+                self.refresh_sessions()
+                
+                # Выбираем новую сессию
+                self.session_combo.setCurrentText(phone)
+            
+        except Exception as e:
+            self.log_message(f"❌ Ошибка при создании сессии: {str(e)}")
+            if 'client' in locals():
+                client.disconnect()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
