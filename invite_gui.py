@@ -1,20 +1,5 @@
-"""
-DEPRECATED: Этот файл больше не используется.
-Функциональность перенесена в новую структуру проекта:
-- Основной файл: src/main.py
-- UI компоненты: src/ui/*
-- Работа с Telegram: src/workers/*
-- База данных: src/database/*
-- Утилиты: src/utils/*
-
-Дата переноса: [текущая дата]
-"""
-
-import sys
 import os
-from src.ui.main_window import MainWindow
-from src.utils.session_manager import SessionManager
-from src.utils.constants import BASE_DIR, SESSIONS_DIR, CONFIGS_DIR, DATA_DIR, LOGS_DIR, TEMP_DIR
+import sys
 import json
 import asyncio
 import sqlite3
@@ -32,12 +17,6 @@ from PySide6.QtWidgets import (
     QInputDialog, QFileDialog
 )
 from PySide6.QtCore import QThread, Signal
-from src.ui.invite_tab import InviteTab
-from src.ui.check_tab import CheckTab
-from src.workers.telegram_worker import TelegramWorker
-from src.workers.check_worker import CheckAccountsWorker
-from src.utils.session_manager import SessionManager
-from src.utils.config_manager import ConfigManager
 
 class TelegramWorker(QThread):
     update_log = Signal(str)
@@ -72,28 +51,15 @@ class TelegramWorker(QThread):
                 is_admin=True,
                 title="Member"
             )
-            self.last_error_message = ""
             return True
-            
         except errors.RPCError as e:
             error_message = str(e)
-            if "Recently logged-in users cannot add or change admins" in error_message:
-                self.last_error_message = "недавно авторизован"
-                self.update_log.emit("⚠️ Этот аккаунт был недавно авторизован и пока не может добавлять администраторов")
-                self.update_log.emit("🔄 Пожалуйста, используйте другую сессию или подождите ~24 часа")
+            if "admin rights do not allow you to do this" in error_message:
+                self.update_log.emit("❌ У вас недостаточно прав администратора для добавления пользователей")
+                self.update_log.emit("🛑 Работа бота остановлена")
+                self.stop_flag = True  # Останавливаем бота
                 return False
-            elif "USER_PRIVACY_RESTRICTED" in error_message:
-                self.update_log.emit(f"❌ Пользователь {user} запретил добавление в группы")
-            elif "CHAT_ADMIN_REQUIRED" in error_message:
-                self.update_log.emit("❌ Нет прав администратора")
-            else:
-                self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
-            self.last_error_message = error_message
-            return False
-            
-        except Exception as e:
-            self.last_error_message = str(e)
-            self.update_log.emit(f"❌ Неизвестная ошибка при инвайте {user}: {str(e)}")
+            self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
             return False
 
     async def get_participant_usernames(self):
@@ -136,6 +102,7 @@ class TelegramWorker(QThread):
     async def get_channel_id(self, channel_link):
         """Получение ID канала из ссылки"""
         try:
+            # Очищаем ссылку от лишнего
             if channel_link.startswith('https://t.me/'):
                 channel_link = channel_link[13:]
             elif channel_link.startswith('@'):
@@ -143,32 +110,12 @@ class TelegramWorker(QThread):
             elif channel_link.startswith('t.me/'):
                 channel_link = channel_link[5:]
             
+            # Получаем информацию о канале
             channel = await self.client.get_entity(channel_link)
             return channel.id
         except Exception as e:
             self.update_log.emit(f"❌ Ошибка при получении ID канала: {str(e)}")
             return None
-
-    async def connect_client(self):
-        """Подключение к клиенту Telegram"""
-        try:
-            self.update_log.emit("🔄 Подключение к Telegram...")
-            
-            session_file = os.path.join('sessions', self.phone)
-            self.client = TelegramClient(session_file, self.api_id, self.api_hash)
-            
-            await self.client.connect()
-            
-            if not await self.client.is_user_authorized():
-                self.update_log.emit("❌ Сессия не авторизована")
-                return False
-                
-            self.update_log.emit("✅ Успешное подключение к Telegram")
-            return True
-            
-        except Exception as e:
-            self.update_log.emit(f"❌ Ошибка при подключении: {str(e)}")
-            return False
 
     async def connect_and_get_channel(self, channel_link):
         """Подключение к Telegram и получение ID канала"""
@@ -177,6 +124,7 @@ class TelegramWorker(QThread):
             
         channel_id = await self.get_channel_id(channel_link)
         if channel_id:
+            # Преобразуем ID в формат, который требует Telegram
             if channel_id > 0:
                 channel_id = int(f"-100{channel_id}")
             self.update_log.emit(f"✅ ID канала получен успешно: {channel_id}")
@@ -184,12 +132,13 @@ class TelegramWorker(QThread):
         return None
 
     async def bulk_invite(self):
-        """Массовое приглашение пользователей"""
+        # Сначала получаем ID канала
         self.channel_id = await self.connect_and_get_channel(self.channel_link)
         if not self.channel_id:
             self.update_log.emit("❌ Не удалось получить ID канала")
             return 0, 0
 
+        # Получаем список текущих подписчиков
         existing_participants = await self.get_participant_usernames()
         
         successful = 0
@@ -203,6 +152,7 @@ class TelegramWorker(QThread):
                 break
 
             try:
+                # Проверяем, является ли пользователь уже подписчиком
                 user_id = user.replace('@', '').lower() if isinstance(user, str) else str(user)
                 if user_id in existing_participants:
                     self.update_log.emit(f"⏭️ Пользователь {user} уже подписан на канал")
@@ -211,18 +161,22 @@ class TelegramWorker(QThread):
 
                 result = await self.invite_user(self.client, self.channel_id, user)
                 if not result:
+                    # Проверяем, была ли это ошибка недавней авторизации
                     if "недавно авторизован" in self.last_error_message:
                         self.update_log.emit("🛑 Остановка процесса из-за ограничения недавней авторизации")
-                        break
+                        break  # Прерываем цикл
                     failed += 1
                 else:
                     successful += 1
 
+                # Обновляем прогресс
                 progress = int((i + 1) / total_users * 100)
                 self.update_progress.emit(progress)
 
+                # Пауза между пользователями
                 await asyncio.sleep(4)
 
+                # Пауза после каждой партии
                 if (i + 1) % self.users_per_batch == 0 and i + 1 < total_users:
                     self.update_log.emit(f"⏳ Пауза на {self.batch_delay} секунд...")
                     await asyncio.sleep(self.batch_delay)
@@ -238,7 +192,6 @@ class TelegramWorker(QThread):
         return successful, failed
 
     def run(self):
-        """Запуск процесса в отдельном потоке"""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         success = 0
@@ -260,9 +213,29 @@ class TelegramWorker(QThread):
                 pass
             self.finished_signal.emit((success, failed))
 
-    def stop(self):
-        """Остановка процесса"""
-        self.stop_flag = True
+    async def connect_client(self):
+        """Подключение к клиенту Telegram"""
+        try:
+            self.update_log.emit("🔄 Подключение к Telegram...")
+            
+            # Создаем клиента
+            session_file = os.path.join('sessions', self.phone)
+            self.client = TelegramClient(session_file, self.api_id, self.api_hash)
+            
+            # Подключаемся
+            await self.client.connect()
+            
+            # Проверяем авторизацию
+            if not await self.client.is_user_authorized():
+                self.update_log.emit("❌ Сессия не авторизована")
+                return False
+                
+            self.update_log.emit("✅ Успешное подключение к Telegram")
+            return True
+            
+        except Exception as e:
+            self.update_log.emit(f"❌ Ошибка при подключении: {str(e)}")
+            return False
 
 class UserDatabase:
     def __init__(self):
