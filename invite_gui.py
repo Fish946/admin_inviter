@@ -44,13 +44,20 @@ class TelegramWorker(QThread):
     async def invite_user(self, client, chat_id, user):
         """Приглашение пользователя"""
         try:
+            # Получаем информацию о пользователе
             user_to_add = await client.get_entity(user)
+            
+            # Пытаемся добавить пользователя как админа
             await client.edit_admin(
                 chat_id,
                 user_to_add,
                 is_admin=True,
                 title="Member"
             )
+<<<<<<< HEAD
+=======
+            self.last_error_message = ""  # Очищаем сообщение об ошибке при успехе
+>>>>>>> 16e6f3a8bdd64f071a9bcb9f4e8208abca448afe
             return True
         except errors.RPCError as e:
             error_message = str(e)
@@ -58,8 +65,22 @@ class TelegramWorker(QThread):
                 self.update_log.emit("❌ У вас недостаточно прав администратора для добавления пользователей")
                 self.update_log.emit("🛑 Работа бота остановлена")
                 self.stop_flag = True  # Останавливаем бота
+<<<<<<< HEAD
                 return False
             self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
+=======
+                return False
+            elif "Recently logged-in users cannot add" in error_message:
+                self.last_error_message = "недавно авторизован"
+                self.update_log.emit("⚠️ Этот аккаунт был недавно авторизован и пока не может добавлять администраторов")
+                self.update_log.emit("🔄 Пожалуйста, используйте другую сессию или подождите ~24 часа")
+                return False
+            elif "USER_PRIVACY_RESTRICTED" in error_message:
+                self.update_log.emit(f"❌ Пользователь {user} запретил добавление в группы")
+            else:
+                self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
+            self.last_error_message = error_message
+>>>>>>> 16e6f3a8bdd64f071a9bcb9f4e8208abca448afe
             return False
 
     async def get_participant_usernames(self):
