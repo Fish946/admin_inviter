@@ -65,35 +65,36 @@ class TelegramWorker(QThread):
     async def invite_user(self, client, chat_id, user):
         """Приглашение пользователя"""
         try:
+            # Получаем информацию о пользователе
             user_to_add = await client.get_entity(user)
+            
+            # Пытаемся добавить пользователя как админа
             await client.edit_admin(
                 chat_id,
                 user_to_add,
                 is_admin=True,
                 title="Member"
             )
-            self.last_error_message = ""
+            self.last_error_message = ""  # Очищаем сообщение об ошибке при успехе
             return True
             
         except errors.RPCError as e:
             error_message = str(e)
-            if "Recently logged-in users cannot add or change admins" in error_message:
+            if "admin rights do not allow you to do this" in error_message:
+                self.update_log.emit("❌ У вас недостаточно прав администратора для добавления пользователей")
+                self.update_log.emit("🛑 Работа бота остановлена")
+                self.stop_flag = True  # Останавливаем бота
+                return False
+            elif "Recently logged-in users cannot add" in error_message:
                 self.last_error_message = "недавно авторизован"
                 self.update_log.emit("⚠️ Этот аккаунт был недавно авторизован и пока не может добавлять администраторов")
                 self.update_log.emit("🔄 Пожалуйста, используйте другую сессию или подождите ~24 часа")
                 return False
             elif "USER_PRIVACY_RESTRICTED" in error_message:
                 self.update_log.emit(f"❌ Пользователь {user} запретил добавление в группы")
-            elif "CHAT_ADMIN_REQUIRED" in error_message:
-                self.update_log.emit("❌ Нет прав администратора")
             else:
                 self.update_log.emit(f"❌ Ошибка при инвайте пользователя {user}: {error_message}")
             self.last_error_message = error_message
-            return False
-            
-        except Exception as e:
-            self.last_error_message = str(e)
-            self.update_log.emit(f"❌ Неизвестная ошибка при инвайте {user}: {str(e)}")
             return False
 
     async def get_participant_usernames(self):
